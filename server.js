@@ -1,15 +1,15 @@
 const express = require("express");
 const cors = require("cors");
+const redisClient = require("./redisClient");
 const { Pool } = require("pg");
 
 const app = express();
-
 app.use(cors());
 app.use(express.json());
 
 const pool = new Pool({
   user: "postgres",
-  host: "host.docker.internal",
+  host: "postgres",
   database: "product_db",
   password: "Prema",
   port: 5432,
@@ -19,7 +19,6 @@ app.get("/", (req, res) => {
   res.send("Server running");
 });
 
-/* ------------------ CREATE PRODUCT ------------------ */
 app.post("/product", async (req, res) => {
   const {
     title,
@@ -49,6 +48,7 @@ app.post("/product", async (req, res) => {
         brand || "",
       ],
     );
+    await redisClient.flushAll();
 
     const insertedId = result.rows[0].id;
     res.json({ message: "Product created successfully", id: insertedId });
@@ -58,62 +58,80 @@ app.post("/product", async (req, res) => {
   }
 });
 
-/* ------------------ GET ONE PRODUCT ------------------ */
 app.get("/get_products/:id", async (req, res) => {
+  const id = req.params.id;
+  const cacheKey = `product:${id}`;
+
   try {
+    const cachedData = await redisClient.get(cacheKey);
+    if (cachedData) {
+      console.log("Cache HIT ");
+      return res.json(JSON.parse(cachedData));
+    }
+
+    console.log("Cache MISS ");
+
     const result = await pool.query(
       "SELECT * FROM products WHERE id=$1 AND is_active=true",
-      [req.params.id],
+      [id],
     );
+
     if (result.rows.length === 0)
       return res.status(404).json({ message: "Product not found" });
-    res.json(result.rows[0]);
+
+    const product = result.rows[0];
+    await redisClient.setEx(cacheKey, 60, JSON.stringify(product));
+
+    res.json(product);
   } catch (err) {
     res.status(500).send("Server error");
   }
 });
 
-/* ------------------ PAGINATED PRODUCTS ------------------ */
 app.get("/get_products", async (req, res) => {
   const page = parseInt(req.query.page) || 1;
   const limit = parseInt(req.query.limit) || 12;
   const keyword = req.query.keyword?.trim() || "";
   const category = req.query.category || "all";
-  const offset = (page - 1) * limit;
+
+  const cacheKey = `products:${page}:${limit}:${keyword}:${category}`;
 
   try {
+    const cachedData = await redisClient.get(cacheKey);
+    if (cachedData) {
+      console.log("Cache HIT ");
+      return res.json(JSON.parse(cachedData));
+    }
+
+    console.log("Cache MISS ");
+
+    const offset = (page - 1) * limit;
+
     let filters = [];
     let filterParams = [];
-
     let idx = 1;
 
-    // SEARCH (keyword)
     if (keyword) {
       filters.push(
         `(LOWER(title) LIKE LOWER($${idx}) 
           OR LOWER(category) LIKE LOWER($${idx}) 
-          OR CAST(price AS TEXT) LIKE $${idx})`
+          OR CAST(price AS TEXT) LIKE $${idx})`,
       );
       filterParams.push(`%${keyword}%`);
       idx++;
     }
 
-    // CATEGORY filter
     if (category !== "all") {
-      filters.push(`category = $${idx}`);
+      filters.push(`LOWER(category) = LOWER($${idx})`);
       filterParams.push(category);
       idx++;
     }
 
-    // Build WHERE condition
     let whereClause = `WHERE is_active=true`;
     if (filters.length > 0) {
       whereClause += ` AND ` + filters.join(" AND ");
     }
 
-    /* ----- FINAL QUERIES ----- */
-
-    // Main data query (with pagination)
     const dataQuery = `
       SELECT * FROM products 
       ${whereClause}
@@ -123,7 +141,6 @@ app.get("/get_products", async (req, res) => {
 
     const dataParams = [...filterParams, limit, offset];
 
-    // Count total rows (without limit/offset)
     const countQuery = `
       SELECT COUNT(*) FROM products
       ${whereClause}
@@ -131,30 +148,42 @@ app.get("/get_products", async (req, res) => {
 
     const countParams = [...filterParams];
 
-    /* ----- RUN QUERIES ----- */
     const data = await pool.query(dataQuery, dataParams);
     const countData = await pool.query(countQuery, countParams);
 
     const totalRows = parseInt(countData.rows[0].count);
     const totalPages = Math.ceil(totalRows / limit);
 
-    res.json({
+    const response = {
       page,
       limit,
       totalPages,
       totalRows,
       data: data.rows,
-    });
+    };
+    await redisClient.setEx(cacheKey, 60, JSON.stringify(response));
 
+    res.json(response);
   } catch (err) {
     console.error(err);
     res.status(500).send(err);
   }
 });
-/* ------------------ SEARCH LOGGER ------------------ */
+
 app.post("/search", async (req, res) => {
   const { product_id, keyword, category } = req.body;
+
+  const cacheKey = `search:${keyword}:${category}`;
+
   try {
+    const cachedData = await redisClient.get(cacheKey);
+    if (cachedData) {
+      console.log("Search Cache HIT ");
+      return res.json(JSON.parse(cachedData));
+    }
+
+    console.log("Search Cache MISS ");
+
     if (keyword && keyword.trim() !== "") {
       await pool.query(
         `INSERT INTO search_history(product_id, search_keyword) VALUES ($1,$2)`,
@@ -181,14 +210,17 @@ app.post("/search", async (req, res) => {
     query += " ORDER BY id LIMIT 50";
 
     const result = await pool.query(query, params);
-    res.json({ data: result.rows });
+
+    const response = { data: result.rows };
+    await redisClient.setEx(cacheKey, 60, JSON.stringify(response));
+
+    res.json(response);
   } catch (err) {
     console.error(err);
     res.status(500).send("Search error");
   }
 });
 
-/* ------------------ VIEWS LOGGER ------------------ */
 app.post("/view", async (req, res) => {
   const { product_id, product_name } = req.body;
   try {
@@ -202,7 +234,6 @@ app.post("/view", async (req, res) => {
   }
 });
 
-/* ------------------ DELETE PRODUCT ------------------ */
 app.delete("/product/:id", async (req, res) => {
   try {
     await pool.query("UPDATE products SET is_active=false WHERE id=$1", [
@@ -214,7 +245,6 @@ app.delete("/product/:id", async (req, res) => {
   }
 });
 
-/* ------------------ EDIT / UPDATE PRODUCT ------------------ */
 app.post("/product/:id", async (req, res) => {
   const {
     title,
@@ -229,7 +259,6 @@ app.post("/product/:id", async (req, res) => {
   const id = req.params.id;
 
   try {
-    // Update the product with new values
     const result = await pool.query(
       `UPDATE products
        SET title=$1,
@@ -265,12 +294,10 @@ app.post("/product/:id", async (req, res) => {
   }
 });
 
-app.listen(5000, () => console.log("Server running on port 5000"));
-/* ------------------ GET ALL CATEGORIES ------------------ */
 app.get("/get_categories", async (req, res) => {
   try {
     const result = await pool.query(
-      "SELECT DISTINCT category FROM products WHERE is_active=true ORDER BY category"
+      "SELECT DISTINCT category FROM products WHERE is_active=true ORDER BY category",
     );
 
     const categories = result.rows.map((row) => row.category);
@@ -281,3 +308,5 @@ app.get("/get_categories", async (req, res) => {
     res.status(500).send("Server error");
   }
 });
+
+app.listen(5000, () => console.log("Server running on port 5000"));
