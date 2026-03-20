@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const redisClient = require("./redisClient");
+const { connectProducer, sendQueryLog } = require("./kafkaProducer");
 const { Pool } = require("pg");
 
 const app = express();
@@ -59,13 +60,24 @@ app.post("/product", async (req, res) => {
 });
 
 app.get("/get_products/:id", async (req, res) => {
+  const start = Date.now();
+
   const id = req.params.id;
   const cacheKey = `product:${id}`;
 
   try {
     const cachedData = await redisClient.get(cacheKey);
+
     if (cachedData) {
       console.log("Cache HIT ");
+
+      await sendQueryLog({
+        route: "/get_products/:id",
+        productId: id,
+        source: "CACHE",
+        responseTime: Date.now() - start,
+      });
+
       return res.json(JSON.parse(cachedData));
     }
 
@@ -76,11 +88,27 @@ app.get("/get_products/:id", async (req, res) => {
       [id],
     );
 
-    if (result.rows.length === 0)
+    if (result.rows.length === 0) {
+      await sendQueryLog({
+        route: "/get_products/:id",
+        productId: id,
+        source: "NOT_FOUND",
+        responseTime: Date.now() - start,
+      });
+
       return res.status(404).json({ message: "Product not found" });
+    }
 
     const product = result.rows[0];
-    await redisClient.setEx(cacheKey, 60, JSON.stringify(product));
+
+    await redisClient.setEx(cacheKey, 3660, JSON.stringify(product));
+
+    await sendQueryLog({
+      route: "/get_products/:id",
+      productId: id,
+      source: "DB",
+      responseTime: Date.now() - start,
+    });
 
     res.json(product);
   } catch (err) {
@@ -89,6 +117,8 @@ app.get("/get_products/:id", async (req, res) => {
 });
 
 app.get("/get_products", async (req, res) => {
+  const start = Date.now();
+
   const page = parseInt(req.query.page) || 1;
   const limit = parseInt(req.query.limit) || 12;
   const keyword = req.query.keyword?.trim() || "";
@@ -98,8 +128,20 @@ app.get("/get_products", async (req, res) => {
 
   try {
     const cachedData = await redisClient.get(cacheKey);
+
     if (cachedData) {
       console.log("Cache HIT ");
+
+      sendQueryLog({
+        route: "/get_products",
+        source: "CACHE",
+        page,
+        limit,
+        keyword,
+        category,
+        responseTime: Date.now() - start,
+      }).catch(console.error);
+
       return res.json(JSON.parse(cachedData));
     }
 
@@ -115,7 +157,7 @@ app.get("/get_products", async (req, res) => {
       filters.push(
         `(LOWER(title) LIKE LOWER($${idx}) 
           OR LOWER(category) LIKE LOWER($${idx}) 
-          OR CAST(price AS TEXT) LIKE $${idx})`,
+          OR CAST(price AS TEXT) LIKE $${idx})`
       );
       filterParams.push(`%${keyword}%`);
       idx++;
@@ -161,7 +203,19 @@ app.get("/get_products", async (req, res) => {
       totalRows,
       data: data.rows,
     };
-    await redisClient.setEx(cacheKey, 60, JSON.stringify(response));
+
+    await redisClient.setEx(cacheKey, 3660, JSON.stringify(response));
+
+    sendQueryLog({
+      route: "/get_products",
+      source: "DB",
+      page,
+      limit,
+      keyword,
+      category,
+      totalRows,
+      responseTime: Date.now() - start,
+    }).catch(console.error);
 
     res.json(response);
   } catch (err) {
@@ -171,14 +225,27 @@ app.get("/get_products", async (req, res) => {
 });
 
 app.post("/search", async (req, res) => {
+  const start = Date.now();
+
   const { product_id, keyword, category } = req.body;
 
   const cacheKey = `search:${keyword}:${category}`;
 
   try {
     const cachedData = await redisClient.get(cacheKey);
+
     if (cachedData) {
       console.log("Search Cache HIT ");
+
+      sendQueryLog({
+        route: "/search",
+        source: "CACHE",
+        keyword,
+        category,
+        productId: product_id,
+        responseTime: Date.now() - start,
+      }).catch(console.error);
+
       return res.json(JSON.parse(cachedData));
     }
 
@@ -212,7 +279,18 @@ app.post("/search", async (req, res) => {
     const result = await pool.query(query, params);
 
     const response = { data: result.rows };
-    await redisClient.setEx(cacheKey, 60, JSON.stringify(response));
+
+    await redisClient.setEx(cacheKey, 3660, JSON.stringify(response));
+
+    sendQueryLog({
+      route: "/search",
+      source: "DB",
+      keyword,
+      category,
+      productId: product_id,
+      resultCount: result.rows.length,
+      responseTime: Date.now() - start,
+    }).catch(console.error);
 
     res.json(response);
   } catch (err) {
@@ -309,4 +387,7 @@ app.get("/get_categories", async (req, res) => {
   }
 });
 
-app.listen(5000, () => console.log("Server running on port 5000"));
+app.listen(5000, async () => {
+  console.log("Server running on port 5000");
+  await connectProducer();
+});
